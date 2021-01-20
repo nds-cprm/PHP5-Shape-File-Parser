@@ -9,19 +9,33 @@
  *   - http://www.easywms.com/easywms/?q=en/node/78
  *   - Drupal's Geo/Spatial Tools modules. (http://drupal.org/project/geo, http://drupal.org/project/spatial)
  */
- 
+
 class shpParser {
+  const GEOPHP_PATH = "geophp/geoPHP.inc";
+
+  private $geos_enabled = FALSE;
+
   private $shpFilePath;
   private $shpFile;
   private $headerInfo = array();
   private $shpData = array();
+
+  public function __construct() {
+    $dir = dirname(__FILE__) . "/" . self::GEOPHP_PATH;
+
+    if (file_exists($dir)) { 
+      require_once $dir;
+      $this->geos_enabled = geoPHP::geosInstalled();
+    }
+  }
   
   public function load($path) {
     $this->shpFilePath = $path;
     $this->shpFile = fopen($this->shpFilePath, "rb");
-    $this->loadHeaders();
-    
-    $shpData = $this->loadRecords();
+    $this->loadHeaders();    
+    $this->loadRecords();
+
+    fclose($this->shpFile);
   }
   
   public function headerInfo() {
@@ -29,7 +43,50 @@ class shpParser {
   }
   
   public function getShapeData() {
+    if (!$this->geos_enabled) {
+      trigger_error("GEOS não está carregado, não será possível validar a integridade das geometrias ", E_USER_WARNING);
+    }
+
     return $this->shpData;
+  }
+
+  private function loadPRJ(){
+    $crs = -1;  // Padrão para shapes sem projeção
+
+    // Identifica se ele possui arquivo prj 
+    // #TODO: (Ele ainda não trata CaSe SenSitive)
+    $prj = preg_replace("/.shp$/i", ".prj", $this->shpFilePath);
+    
+    // Interpretação do .prj
+    // TODO: Melhorar o suporte para outras projeções
+    // TODO: Integrar com a lib Proj4? Se sim, este if desaparece
+    if (file_exists($prj)) {
+      $prjFile = fopen($prj, "r");
+      $prjWKT = trim(fgets($prjFile, 4096));
+      fclose($prjFile);
+
+      if (preg_match("/^GEOGCS/i", $prjWKT)) {        
+        if ( // WGS84 
+            preg_match('/D_WGS_1984/i', $prjWKT) ||                 // ESRI WKT (identificado pelo Nome do Datum)
+            preg_match('/AUTHORITY["EPSG","4326"]/i', $prjWKT)      // OGC WKT (identificado pela Autoridade identificadora - EPSG)
+            ) {          
+          $crs = 4326;
+        } else if ( // SIRGAS2000
+            preg_match('/D_SIRGAS_2000/i', $prjWKT)  ||             // ESRI WKT (identificado pelo Nome do Datum)
+            preg_match('/AUTHORITY["EPSG","4674"]/i', $prjWKT)      // OGC WKT (identificado pela Autoridade identificadora - EPSG)
+          ) {          
+          $crs = 4674;
+        } else {      
+          throw new Exception("Projeção não reconhecida: " . $prjWKT);
+        }
+      } else if (preg_match("/^PROJCS/i", $prjWKT)) {
+        throw new Exception("Ainda não há suporte para SRC projetadas (UTM, Policônica)");  
+      } else {
+        throw new Exception("Suporta apenas WGS-84 e SIRGAS 2000 Geográficos");
+      }
+    }
+    
+    return $crs;    
   }
   
   private function geomTypes() {
@@ -80,6 +137,7 @@ class shpParser {
         'name' => $this->geoTypeFromID($shape_type),
       ),
       'boundingBox' => $bounding_box,
+      'crs' => $this->loadPRJ(),   // 4326, 4674, -1 ou erro
     );
   }
   
@@ -151,6 +209,7 @@ class shpParser {
         break;
       case 'Polygon':
         $record['geom'] = $this->loadPolygonRecord();
+        //$record['geom'] = $this->loadPolygonRecordSdo();
         break;
       case 'MultiPoint':
         $record['geom'] = $this->loadMultiPointRecord();
@@ -158,6 +217,17 @@ class shpParser {
       default:
         // $setError(sprintf("The Shape Type '%s' is not supported.", $shapeType));
         break;
+    }
+
+    // Inclui no Array GEOM um item chamado valid, resultado de validação pelo GEOS.
+    // Caso o item "valid" não exista, é porque não foi validado
+    if (array_key_exists("geom", $record)) {
+      $wkt = $record['geom']['wkt'];
+
+      if ($this->geos_enabled && !is_null($wkt)) {
+        $valid = geoPHP::load($wkt,'wkt')->checkValidity();
+        $record['geom'] = array_merge($record['geom'], $valid);
+      }
     }
     
     return $record;
@@ -167,6 +237,8 @@ class shpParser {
     $data = array();
     $data['x'] = $this->loadData("d");
     $data['y'] = $this->loadData("d");
+    //$data['x'] = number_format($this->loadData("d"), 12);
+    //$data['y'] = number_format($this->loadData("d"), 12);
     return $data;
   }
   
@@ -219,7 +291,37 @@ class shpParser {
     
     return $return;
   }
+
+  private function loadPolygonRecordSdo() {
+    $return = array(
+      'bbox' => array(
+        'xmin' => $this->loadData("d"),
+        'ymin' => $this->loadData("d"),
+        'xmax' => $this->loadData("d"),
+        'ymax' => $this->loadData("d"),
+      ),
+    );
+
+    $geometries = $this->processLineStrings();
+
+    $return['numGeometries'] = $geometries['numParts'];
+    for($x=0;$x<count($geometries['geometries']);$x++){
+        $geometries['geometries'][$x] = str_replace(", ", ",", $geometries['geometries'][$x]);
+        $geometries['geometries'][$x] = str_replace(" ", ",", $geometries['geometries'][$x]);
+    }
+    if ($geometries['numParts'] == 1) {
+//            for($x=0;$x<count($geometries['geometries']);$x++){
+//                $geometries['geometries'][$x] = str_replace(" ", ",", $geometries['geometries'][$x]);
+//            }
+        //echo "<hr />".var_dump($geometries['geometries'])."<hr />";
+        $return['sdo'] = implode(',', $geometries['geometries']);
+    }else{ // Multipolygon
+        $return['sdo'] = '( ' . implode(',', $geometries['geometries']) . ')';
+    }
+    return $return;
+  }
   
+
   /**
    * Process function for loadPolyLineRecord and loadPolygonRecord.
    * Returns geometries array.
@@ -244,7 +346,9 @@ class shpParser {
     
     if ($numParts == 1) {
       for ($i = 0; $i < $numPoints; $i++) {
-        $geometries[] = sprintf('%f %f', $points[$i]['x'], $points[$i]['y']);
+        //$geometries[] = sprintf('%f %f', $points[$i]['x'], $points[$i]['y']); // Aqui ele deixa as coordenadas com 6 casas decimais
+        //array_push($geometries, number_format($points[$i]['x'],13), number_format($points[$i]['y'],13));
+        array_push($geometries, number_format($points[$i]['x'],13)." ".number_format($points[$i]['y'],13));
       }
       
     }
@@ -252,7 +356,10 @@ class shpParser {
       for ($i = 0; $i < $numParts; $i++) {
         $my_points = array();
         for ($j = $parts[$i]; $j < $parts[$i + 1]; $j++) {
-          $my_points[] = sprintf('%f %f', $points[$j]['x'], $points[$j]['y']);
+          //$my_points[] = sprintf('%f %f', $points[$j]['x'], $points[$j]['y']);
+          //$my_points[] = ($points[$j]['x'], $points[$j]['y']);
+          //array_push($my_points, number_format($points[$j]['x'],13), number_format($points[$j]['y'],13));
+          array_push($my_points, number_format($points[$j]['x'],13)." ".number_format($points[$j]['y'],13));
         }
         $geometries[] = '(' . implode(', ', $my_points) . ')';
       }
